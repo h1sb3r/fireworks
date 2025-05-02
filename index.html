@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Feux d'Artifice Automatiques</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-family: sans-serif;
+            font-size: 14px;
+            background: rgba(0,0,0,0.5);
+            padding: 5px 10px;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">Simulation de Feux d'Artifice Automatiques</div>
+    <canvas id="fireworks-canvas"></canvas>
+
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/"
+      }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+        // --- Constants ---
+        const MAX_FIREWORKS = 20; // Un peu plus pour le mode auto
+        const PARTICLES_PER_FIREWORK = 300; // Un peu plus pour des explosions plus fournies
+        const TOTAL_PARTICLES = MAX_FIREWORKS * PARTICLES_PER_FIREWORK;
+        const ROCKET_LIFETIME = 1.2; // Temps de montée un peu plus court
+        const PARTICLE_LIFETIME_MIN = 1.8; // Durée de vie un peu plus longue pour les traînées
+        const PARTICLE_LIFETIME_MAX = 2.8;
+        const GRAVITY = -8.0; // Gravité légèrement réduite
+        const BASE_PARTICLE_SIZE = 1.8; // Taille de base un peu plus grande
+        const EXPLOSION_SPEED_MIN = 18.0;
+        const EXPLOSION_SPEED_MAX = 35.0;
+
+        // --- NOUVEAU: Constantes pour l'auto-lancement ---
+        const LAUNCH_INTERVAL_MIN = 0.5; // Temps minimum entre les lancements (secondes)
+        const LAUNCH_INTERVAL_MAX = 1.5; // Temps maximum
+        const LAUNCH_AREA_RADIUS = 80.0; // Rayon de la zone de lancement au sol
+
+        // --- NOUVEAU: Constantes pour types d'explosion ---
+        const FIREWORK_TYPE_SPHERE = 0;
+        const FIREWORK_TYPE_RING = 1;
+        // Ajouter d'autres types ici si désiré
+
+        const BLOOM_STRENGTH = 1.7;
+        const BLOOM_RADIUS = 0.7;
+        const BLOOM_THRESHOLD = 0.45; // Encore plus bas pour capturer les traînées faibles
+
+        let scene, camera, renderer, composer, controls, particles, particleGeometry, particleMaterial;
+        const clock = new THREE.Clock();
+        let currentFireworkIndex = 0;
+        let timeSinceLastLaunch = LAUNCH_INTERVAL_MAX; // Pour lancer un feu dès le début
+        let nextLaunchInterval = LAUNCH_INTERVAL_MIN + Math.random() * (LAUNCH_INTERVAL_MAX - LAUNCH_INTERVAL_MIN);
+
+        // --- Uniforms ---
+        const fireworkUniforms = {
+            uTime: { value: 0.0 },
+            uGravity: { value: new THREE.Vector3(0, GRAVITY, 0) },
+            uBaseParticleSize: { value: BASE_PARTICLE_SIZE }
+        };
+
+        // --- Shaders pour les Feux d'Artifice (avec traînées simples) ---
+        const fireworkShader = {
+            vertexShader: `
+                uniform float uTime;
+                uniform vec3 uGravity;
+                uniform float uBaseParticleSize;
+
+                attribute vec3 aStartPosition;
+                attribute vec3 aVelocity;
+                attribute vec3 aColor;
+                attribute float aStartTime;
+                attribute float aLifetime;
+                attribute float aIsRocket;
+                attribute float aRocketTargetTime;
+
+                varying vec3 vColor;
+                varying float vAlpha;
+                varying float vIsRocket;
+                varying float vLifetimeProgress; // NOUVEAU: Pour passer la progression au fragment shader
+
+                void main() {
+                    vColor = aColor;
+                    vIsRocket = aIsRocket;
+                    vAlpha = 0.0;
+                    vLifetimeProgress = 0.0;
+                    float timeElapsed = uTime - aStartTime;
+
+                    if (timeElapsed < 0.0) {
+                      gl_Position = vec4(0.0, 0.0, 0.0, 0.0);
+                      return;
+                    }
+
+                    vec3 currentPosition = aStartPosition;
+                    float lifetimeProgress = 0.0;
+                    float pointSize = uBaseParticleSize;
+
+                    if (aIsRocket > 0.5) {
+                        // Fusée
+                        if (uTime < aRocketTargetTime) {
+                            float rocketProgress = timeElapsed / (aRocketTargetTime - aStartTime);
+                            currentPosition = aStartPosition + aVelocity * timeElapsed;
+                            vAlpha = 1.0 - rocketProgress * rocketProgress; // Fondu plus rapide à la fin
+                            pointSize *= (1.0 + (1.0 - rocketProgress) * 2.0);
+                            vLifetimeProgress = rocketProgress; // Pour info au fragment
+                        } else {
+                            gl_Position = vec4(0.0, 0.0, 0.0, 0.0); return;
+                        }
+                    } else {
+                        // Particule d'Explosion
+                        lifetimeProgress = timeElapsed / aLifetime;
+                        vLifetimeProgress = lifetimeProgress; // NOUVEAU
+                        if (lifetimeProgress >= 0.0 && lifetimeProgress <= 1.0) {
+                            currentPosition = aStartPosition + aVelocity * timeElapsed + 0.5 * uGravity * timeElapsed * timeElapsed;
+                            // Alpha modifié pour traînée : visible plus longtemps, fade rapide à la fin
+                            vAlpha = smoothstep(0.0, 0.1, lifetimeProgress) * (1.0 - smoothstep(0.85, 1.0, lifetimeProgress));
+                            pointSize *= (1.0 - lifetimeProgress * 0.7); // Rétrécit un peu plus
+                         } else {
+                            gl_Position = vec4(0.0, 0.0, 0.0, 0.0); return;
+                        }
+                    }
+
+                    vec4 mvPosition = modelViewMatrix * vec4(currentPosition, 1.0);
+                    if (mvPosition.z > 0.0) { gl_Position = vec4(0.0, 0.0, 0.0, 0.0); return; }
+                    gl_PointSize = pointSize * (400.0 / -mvPosition.z); // Augmenté pour compenser la taille
+                    gl_Position = projectionMatrix * mvPosition;
+                }
+            `,
+            fragmentShader: `
+                varying vec3 vColor;
+                varying float vAlpha;
+                varying float vIsRocket;
+                varying float vLifetimeProgress; // NOUVEAU: Récupère la progression
+
+                void main() {
+                    if (vAlpha <= 0.0) discard;
+
+                    vec2 center = 2.0 * gl_PointCoord - 1.0;
+                    float dist = length(center);
+                    if (dist > 1.0) discard;
+
+                    float mask = (1.0 - dist) * vAlpha;
+
+                    vec3 fragColor;
+                    if (vIsRocket > 0.5) {
+                         fragColor = vec3(1.0, 1.0, 0.8); // Couleur fusée
+                         fragColor *= (1.0 + (1.0 - vLifetimeProgress) * 2.0); // Plus brillant au début
+                    } else {
+                         // NOUVEAU: Effet de traînée par couleur
+                         // La couleur vire au orange/rougeâtre vers la fin de vie
+                         vec3 trailColor = mix(vColor, vec3(1.0, 0.4, 0.1), smoothstep(0.4, 0.9, vLifetimeProgress));
+                         fragColor = trailColor;
+                         // Augmenter la luminosité pour le bloom, moins fort pour les 'braises'
+                         fragColor *= (1.0 + (1.0 - smoothstep(0.0, 0.7, vLifetimeProgress)) * 3.5);
+                    }
+
+                    gl_FragColor = vec4(fragColor, mask);
+                }
+            `
+        };
+
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
+            camera.position.set(0, 60, 180); // Un peu plus loin/haut
+
+            const canvas = document.getElementById('fireworks-canvas');
+            renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setClearColor(0x000005); // Ciel encore plus sombre
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.target.set(0, 50, 0); // Regarder vers le milieu
+
+            // --- Initialisation BufferGeometry (identique) ---
+            particleGeometry = new THREE.BufferGeometry();
+            const startPositions = new Float32Array(TOTAL_PARTICLES * 3);
+            const velocities = new Float32Array(TOTAL_PARTICLES * 3);
+            const colors = new Float32Array(TOTAL_PARTICLES * 3);
+            const startTimes = new Float32Array(TOTAL_PARTICLES);
+            const lifetimes = new Float32Array(TOTAL_PARTICLES);
+            const isRockets = new Float32Array(TOTAL_PARTICLES);
+            const rocketTargetTimes = new Float32Array(TOTAL_PARTICLES);
+
+            for (let i = 0; i < TOTAL_PARTICLES; i++) {
+                startTimes[i] = Infinity; lifetimes[i] = 0; isRockets[i] = 0.0; rocketTargetTimes[i] = Infinity;
+            }
+            particleGeometry.setAttribute('position', new THREE.BufferAttribute(startPositions, 3));
+            particleGeometry.setAttribute('aVelocity', new THREE.BufferAttribute(velocities, 3));
+            particleGeometry.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
+            particleGeometry.setAttribute('aStartTime', new THREE.BufferAttribute(startTimes, 1));
+            particleGeometry.setAttribute('aLifetime', new THREE.BufferAttribute(lifetimes, 1));
+            particleGeometry.setAttribute('aIsRocket', new THREE.BufferAttribute(isRockets, 1));
+            particleGeometry.setAttribute('aRocketTargetTime', new THREE.BufferAttribute(rocketTargetTimes, 1));
+            particleGeometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0,0,0), Infinity);
+
+            // --- Matériel Shader (identique) ---
+            particleMaterial = new THREE.ShaderMaterial({
+                uniforms: fireworkUniforms,
+                vertexShader: fireworkShader.vertexShader,
+                fragmentShader: fireworkShader.fragmentShader,
+                transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
+            });
+
+            particles = new THREE.Points(particleGeometry, particleMaterial);
+            scene.add(particles);
+
+            // --- Post-Processing (Bloom) ---
+            composer = new EffectComposer(renderer);
+            composer.addPass(new RenderPass(scene, camera));
+            const bloomPass = new UnrealBloomPass(
+                new THREE.Vector2(window.innerWidth, window.innerHeight),
+                BLOOM_STRENGTH, BLOOM_RADIUS, BLOOM_THRESHOLD
+            );
+            composer.addPass(bloomPass);
+            composer.addPass(new OutputPass());
+
+            // --- Event Listeners ---
+            // window.addEventListener('click', triggerFireworkOnClick); // Supprimé
+            window.addEventListener('resize', onWindowResize);
+
+            animate();
+        }
+
+        // --- Fonction pour LANCER un Feu d'Artifice ---
+        function launchFirework(launchX, launchZ) {
+            const currentTime = clock.getElapsedTime();
+            const explosionHeight = 60 + Math.random() * 80; // Plus haut en moyenne
+            const explosionTime = currentTime + ROCKET_LIFETIME;
+            const explosionCenter = new THREE.Vector3(launchX, explosionHeight, launchZ);
+            const fireworkColor = new THREE.Color().setHSL(Math.random(), 0.9, 0.65); // Légèrement plus claires
+            const launchPoint = new THREE.Vector3(launchX, 0, launchZ);
+
+            // NOUVEAU: Choisir un type d'explosion
+            const explosionType = Math.random() < 0.6 ? FIREWORK_TYPE_SPHERE : FIREWORK_TYPE_RING; // 60% Sphère, 40% Anneau
+
+            // --- Configurer la fusée ---
+            const fireworkStartIndex = currentFireworkIndex * PARTICLES_PER_FIREWORK;
+            const rocketIndex = fireworkStartIndex;
+            const rocketVelocity = new THREE.Vector3(0, explosionHeight / ROCKET_LIFETIME, 0);
+
+            particleGeometry.attributes.position.setXYZ(rocketIndex, launchPoint.x, launchPoint.y, launchPoint.z);
+            particleGeometry.attributes.aVelocity.setXYZ(rocketIndex, rocketVelocity.x, rocketVelocity.y, rocketVelocity.z);
+            particleGeometry.attributes.aColor.setXYZ(rocketIndex, 1, 1, 0.8);
+            particleGeometry.attributes.aStartTime.setX(rocketIndex, currentTime);
+            particleGeometry.attributes.aLifetime.setX(rocketIndex, ROCKET_LIFETIME);
+            particleGeometry.attributes.aIsRocket.setX(rocketIndex, 1.0);
+            particleGeometry.attributes.aRocketTargetTime.setX(rocketIndex, explosionTime);
+
+            // --- Configurer les particules d'explosion ---
+            for (let i = 1; i < PARTICLES_PER_FIREWORK; i++) {
+                 const particleIndex = fireworkStartIndex + i;
+                 let dirX, dirY, dirZ;
+
+                 // NOUVEAU: Calcul de direction basé sur le type
+                 if (explosionType === FIREWORK_TYPE_SPHERE) {
+                     const theta = Math.random() * Math.PI * 2;
+                     const phi = Math.acos(2 * Math.random() - 1.0);
+                     dirX = Math.sin(phi) * Math.cos(theta);
+                     dirY = Math.sin(phi) * Math.sin(theta);
+                     dirZ = Math.cos(phi);
+                 } else { // FIREWORK_TYPE_RING
+                     const theta = Math.random() * Math.PI * 2;
+                     // Principalement dans le plan XY, avec légère déviation Z
+                     dirX = Math.cos(theta);
+                     dirY = Math.sin(theta);
+                     dirZ = (Math.random() - 0.5) * 0.3; // Faible composante Z
+                     // Normaliser pour une vitesse plus constante (optionnel mais mieux)
+                     const len = Math.sqrt(dirX*dirX + dirY*dirY + dirZ*dirZ);
+                     if (len > 0) { dirX /= len; dirY /= len; dirZ /= len; }
+                 }
+
+                 const speed = EXPLOSION_SPEED_MIN + Math.random() * (EXPLOSION_SPEED_MAX - EXPLOSION_SPEED_MIN);
+                 const velocity = new THREE.Vector3(dirX * speed, dirY * speed, dirZ * speed);
+                 const lifetime = PARTICLE_LIFETIME_MIN + Math.random() * (PARTICLE_LIFETIME_MAX - PARTICLE_LIFETIME_MIN);
+
+                 particleGeometry.attributes.position.setXYZ(particleIndex, explosionCenter.x, explosionCenter.y, explosionCenter.z);
+                 particleGeometry.attributes.aVelocity.setXYZ(particleIndex, velocity.x, velocity.y, velocity.z);
+                 particleGeometry.attributes.aColor.setXYZ(particleIndex, fireworkColor.r, fireworkColor.g, fireworkColor.b);
+                 particleGeometry.attributes.aStartTime.setX(particleIndex, explosionTime);
+                 particleGeometry.attributes.aLifetime.setX(particleIndex, lifetime);
+                 particleGeometry.attributes.aIsRocket.setX(particleIndex, 0.0);
+                 particleGeometry.attributes.aRocketTargetTime.setX(particleIndex, Infinity);
+            }
+
+            // Marquer les attributs modifiés comme nécessitant une mise à jour
+            particleGeometry.attributes.position.needsUpdate = true;
+            particleGeometry.attributes.aVelocity.needsUpdate = true;
+            particleGeometry.attributes.aColor.needsUpdate = true;
+            particleGeometry.attributes.aStartTime.needsUpdate = true;
+            particleGeometry.attributes.aLifetime.needsUpdate = true;
+            particleGeometry.attributes.aIsRocket.needsUpdate = true;
+            particleGeometry.attributes.aRocketTargetTime.needsUpdate = true;
+
+            // Passer au prochain slot de feu d'artifice
+            currentFireworkIndex = (currentFireworkIndex + 1) % MAX_FIREWORKS;
+            // console.log(`Lancement Feu d'artifice ${currentFireworkIndex} (Type: ${explosionType === 0 ? 'Sphère' : 'Anneau'})`);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+            composer.passes.forEach(pass => {
+                if (pass.setSize) pass.setSize(window.innerWidth, window.innerHeight);
+                if (pass.resolution) pass.resolution.set(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            const elapsedTime = clock.getElapsedTime();
+
+            fireworkUniforms.uTime.value = elapsedTime;
+            controls.update();
+
+            // --- NOUVEAU: Logique de lancement automatique ---
+            timeSinceLastLaunch += delta;
+            if (timeSinceLastLaunch >= nextLaunchInterval) {
+                // Lancer un nouveau feu d'artifice
+                const launchX = (Math.random() - 0.5) * LAUNCH_AREA_RADIUS * 2;
+                const launchZ = (Math.random() - 0.5) * LAUNCH_AREA_RADIUS * 2;
+                launchFirework(launchX, launchZ);
+
+                // Réinitialiser le timer
+                timeSinceLastLaunch = 0;
+                nextLaunchInterval = LAUNCH_INTERVAL_MIN + Math.random() * (LAUNCH_INTERVAL_MAX - LAUNCH_INTERVAL_MIN);
+                document.getElementById('info').textContent = `Prochain lancement dans ${nextLaunchInterval.toFixed(1)}s`;
+            } else {
+                 // Mettre à jour le temps restant (optionnel)
+                 const remaining = nextLaunchInterval - timeSinceLastLaunch;
+                 if (elapsedTime > 1) { // Ne pas afficher au tout début
+                    document.getElementById('info').textContent = `Prochain lancement dans ${remaining.toFixed(1)}s`;
+                 }
+            }
+
+            composer.render(delta);
+        }
+
+        init();
+
+    </script>
+</body>
+</html>
