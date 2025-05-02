@@ -2,8 +2,6 @@
 
 Ce projet propose une **simulation interactive de feux d'artifice** réalisée avec **Three.js**, directement exécutable dans un navigateur.
 
-💡 L'animation se déclenche via un bouton "🎆 Lancer l'animation" sur la page d'accueil.
-
 ---
 
 ## 🔗 Démo en ligne
@@ -13,6 +11,9 @@ Ce projet propose une **simulation interactive de feux d'artifice** réalisée a
 > Hébergé via [GitHub Pages](https://pages.github.com)
 
 ---
+![image](https://github.com/user-attachments/assets/e9670f98-bfaf-4509-bdb7-bca23e322090)
+
+
 
 ## 📁 Contenu du projet
 
